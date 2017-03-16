@@ -804,6 +804,9 @@ cdef class BayesianNetwork( GraphModel ):
 		elif algorithm == 'exact':
 			structure = discrete_exact_graph(X_int, weights, key_count,
 				pseudocount, max_parents, n_jobs)
+		elif algorithm == 'exact*':
+			structure = discrete_exact_grapha(X_int, weights, key_count,
+				pseudocount, max_parents, n_jobs)
 
 		return BayesianNetwork.from_structure(X, structure, weights,state_names=state_names)
 
@@ -1121,7 +1124,101 @@ def discrete_exact_graph(X, weights, key_count, pseudocount, max_parents, n_jobs
 		structure[idx] = parents
 		score -= order_graph.get_edge_data(u, v)['weight']
 
+	print score
 	return tuple(structure)
+
+
+def discrete_exact_grapha(X, weights, key_count, pseudocount, max_parents, n_jobs):
+	"""
+	Find the optimal graph over a set of variables with no other knowledge.
+
+	This is the naive dynamic programming structure learning task where the 
+	optimal graph is identified from a set of variables using an order graph
+	and parent graphs. This can be used either when no constraint graph is
+	provided or for a SCC which is made up of a node containing a self-loop.
+
+	Parameters
+	----------
+	X : numpy.ndarray, shape=(n, d)
+		The data to fit the structure too, where each row is a sample and
+		each column corresponds to the associated variable.
+
+	weights : numpy.ndarray, shape=(n,)
+		The weight of each sample as a positive double. Default is None.
+
+	key_count : numpy.ndarray, shape=(d,)
+		The number of unique keys in each column.
+
+	pseudocount : double
+		A pseudocount to add to each possibility.
+
+	max_parents : int
+		The maximum number of parents a node can have. If used, this means
+		using the k-learn procedure. Can drastically speed up algorithms.
+		If -1, no max on parents. Default is -1.
+
+	n_jobs : int
+		The number of threads to use when learning the structure of the
+		network. This parallelizes the creation of the parent graphs.
+
+	Returns
+	-------
+	structure : tuple, shape=(d,)
+		The parents for each variable in this SCC
+	"""
+
+	from .utils import PriorityQueue
+
+	cdef int i, n = X.shape[0], d = X.shape[1]
+	cdef list parent_graphs = []
+
+	parent_graphs = Parallel(n_jobs=n_jobs, backend='threading')( 
+		delayed(generate_parent_graph)(X, weights, key_count, i, pseudocount, 
+			max_parents) for i in range(d) )
+
+
+	o = PriorityQueue()
+	c = {}
+
+	all_variables = tuple(range(d))
+	almost_all_variables = {}
+	for i in range(d):
+		almost_all_variables[i] = tuple(j for j in range(d) if j != i)
+
+	o.push(((), 0, [() for i in range(d)]), 0)
+	while o.n > 0:
+		weight, (variables, g, structure) = o.pop()
+
+		if variables in c:
+			continue
+		else:
+			c[variables] = 1
+
+		if variables == all_variables:
+			print g
+			return tuple(structure)
+
+		for i in range(d):
+			if i not in variables:
+				parents, g2 = parent_graphs[i][variables]
+				_, h = parent_graphs[i][almost_all_variables[i]]
+
+				e = g - g2   # Exact path cost
+				f = g - h    # Heuristic cost 
+
+				local_structure = structure[:]
+				local_structure[i] = parents
+				new_variables = tuple(sorted(variables + (i,)))
+				entry = (new_variables, e, local_structure)
+
+				prev_entry = o.get(new_variables)
+				if prev_entry is not None:
+					if prev_entry[0][1] < f:
+						o.push(prev_entry[0], prev_entry[1])
+					else:
+						o.push(entry, f)
+				else:
+					o.push(entry, f)
 
 
 def discrete_exact_slap(X, weights, task, key_count, pseudocount, max_parents, 
