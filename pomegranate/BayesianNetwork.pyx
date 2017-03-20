@@ -288,16 +288,17 @@ cdef class BayesianNetwork( GraphModel ):
 			if i > 0:
 				self.parent_count[i+1] += self.parent_count[i]
 
-	def log_probability( self, sample ):
-		"""Return the log probability of a sample under the Bayesian network model.
+	def log_probability(self, X):
+		"""Return the log probability of samples under the Bayesian network.
 
 		The log probability is just the sum of the log probabilities under each of
 		the components. The log probability of a sample under the graph A -> B is
-		just P(A)*P(B|A).
+		just P(A)*P(B|A). This will return a vector of log probabilities, one for each
+		sample.
 
 		Parameters
 		----------
-		sample : array-like, shape (n_nodes)
+		X : array-like, shape (n_samples, n_dim)
 			The sample is a vector of points where each dimension represents the
 			same variable as added to the graph originally. It doesn't matter what
 			the connections between these variables are, just that they are all
@@ -312,10 +313,13 @@ cdef class BayesianNetwork( GraphModel ):
 		if self.d == 0:
 			raise ValueError("must bake model before computing probability")
 
-		sample = numpy.array(sample, ndmin=2)
-		logp = 0.0
-		for i, state in enumerate( self.states ):
-			logp += state.distribution.log_probability( sample[0, self.idxs[i]] )
+		X = numpy.array(X, ndmin=2)
+		n, d = X.shape
+
+		logp = numpy.zeros(n, dtype='float64')
+		for i in range(n):
+			for j, state in enumerate(self.states):
+				logp[i] += state.distribution.log_probability(X[i, self.idxs[j]])
 
 		return logp
 
@@ -715,7 +719,7 @@ cdef class BayesianNetwork( GraphModel ):
 		return model
 
 	@classmethod
-	def from_samples( cls, X, weights=None, algorithm='chow-liu', max_parents=-1,
+	def from_samples(cls, X, weights=None, algorithm='chow-liu', max_parents=-1,
 		 root=0, constraint_graph=None, pseudocount=0.0, state_names=None, 
 		 n_jobs=1):
 		"""Learn the structure of the network from data.
@@ -734,9 +738,12 @@ cdef class BayesianNetwork( GraphModel ):
 		weights : array-like, shape (n_nodes), optional
 			The weight of each sample as a positive double. Default is None.
 
-		algorithm : str, one of 'chow-liu', 'exact' optional
+		algorithm : str, one of 'chow-liu', 'exact', 'exact-shortest' optional
 			The algorithm to use for learning the Bayesian network. Default is
-			'chow-liu' which returns a tree structure.
+			'chow-liu' which returns a tree structure. The exact algorithm
+			uses DP/A* to find the optimal Bayesian network, and exact-shortest
+			uses DP/shortest path to find the optimal network in a potentially
+			slower manner.
 
 		max_parents : int, optional
 			The maximum number of parents a node can have. If used, this means
@@ -804,14 +811,16 @@ cdef class BayesianNetwork( GraphModel ):
 		elif algorithm == 'exact':
 			structure = discrete_exact_graph(X_int, weights, key_count,
 				pseudocount, max_parents, n_jobs)
-		elif algorithm == 'exact*':
-			structure = discrete_exact_grapha(X_int, weights, key_count,
+		elif algorithm == 'exact-shortest':
+			structure = discrete_exact_graph_shortest(X_int, weights, key_count,
 				pseudocount, max_parents, n_jobs)
+		else:
+			raise ValueError("Invalid algorithm type passed in. Must be one of 'chow-liu', 'exact', 'exact-shortest'")
 
 		return BayesianNetwork.from_structure(X, structure, weights,state_names=state_names)
 
 
-cdef tuple discrete_chow_liu_tree(numpy.ndarray X_ndarray, numpy.ndarray weights_ndarray,
+def discrete_chow_liu_tree(numpy.ndarray X_ndarray, numpy.ndarray weights_ndarray,
 	numpy.ndarray key_count_ndarray, double pseudocount, int root):
 	cdef int i, j, k, l, lj, lk, Xj, Xk, xj, xk
 	cdef int n = X_ndarray.shape[0], d = X_ndarray.shape[1]
@@ -1054,7 +1063,7 @@ def discrete_exact_with_constraints_task(numpy.ndarray X, numpy.ndarray weights,
 	return tuple(structure)
 
 
-def discrete_exact_graph(X, weights, key_count, pseudocount, max_parents, n_jobs):
+def discrete_exact_graph_shortest(X, weights, key_count, pseudocount, max_parents, n_jobs):
 	"""
 	Find the optimal graph over a set of variables with no other knowledge.
 
@@ -1062,6 +1071,9 @@ def discrete_exact_graph(X, weights, key_count, pseudocount, max_parents, n_jobs
 	optimal graph is identified from a set of variables using an order graph
 	and parent graphs. This can be used either when no constraint graph is
 	provided or for a SCC which is made up of a node containing a self-loop.
+	This is a reference implementation that uses the naive shortest path
+	algorithm over the entire order graph. The 'exact' option uses the A* path
+	in order to avoid considering the full order graph.
 
 	Parameters
 	----------
@@ -1124,11 +1136,10 @@ def discrete_exact_graph(X, weights, key_count, pseudocount, max_parents, n_jobs
 		structure[idx] = parents
 		score -= order_graph.get_edge_data(u, v)['weight']
 
-	print score
 	return tuple(structure)
 
 
-def discrete_exact_grapha(X, weights, key_count, pseudocount, max_parents, n_jobs):
+def discrete_exact_graph(X, weights, key_count, pseudocount, max_parents, n_jobs):
 	"""
 	Find the optimal graph over a set of variables with no other knowledge.
 
@@ -1136,6 +1147,8 @@ def discrete_exact_grapha(X, weights, key_count, pseudocount, max_parents, n_job
 	optimal graph is identified from a set of variables using an order graph
 	and parent graphs. This can be used either when no constraint graph is
 	provided or for a SCC which is made up of a node containing a self-loop.
+	It uses DP/A* in order to find the optimal graph without considering all
+	possible topological sorts.
 
 	Parameters
 	----------
@@ -1195,7 +1208,6 @@ def discrete_exact_grapha(X, weights, key_count, pseudocount, max_parents, n_job
 			c[variables] = 1
 
 		if variables == all_variables:
-			print g
 			return tuple(structure)
 
 		for i in range(d):
