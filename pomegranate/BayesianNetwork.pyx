@@ -719,7 +719,7 @@ cdef class BayesianNetwork( GraphModel ):
 		return model
 
 	@classmethod
-	def from_samples(cls, X, weights=None, algorithm='chow-liu', max_parents=-1,
+	def from_samples(cls, X, weights=None, algorithm='a* heuristic', max_parents=-1,
 		 root=0, constraint_graph=None, pseudocount=0.0, state_names=None, 
 		 n_jobs=1):
 		"""Learn the structure of the network from data.
@@ -738,10 +738,10 @@ cdef class BayesianNetwork( GraphModel ):
 		weights : array-like, shape (n_nodes), optional
 			The weight of each sample as a positive double. Default is None.
 
-		algorithm : str, one of 'chow-liu', 'exact', 'exact-shortest' optional
+		algorithm : str, one of 'chow-liu', 'a* heuristic', 'exact', 'exact-shortest' optional
 			The algorithm to use for learning the Bayesian network. Default is
-			'chow-liu' which returns a tree structure. The exact algorithm
-			uses DP/A* to find the optimal Bayesian network, and exact-shortest
+			'a* heuristic' which returns good possibly-optimal structure. The exact 
+			algorithm uses DP/A* to find the optimal Bayesian network, and exact-shortest
 			uses DP/shortest path to find the optimal network in a potentially
 			slower manner.
 
@@ -809,15 +809,139 @@ cdef class BayesianNetwork( GraphModel ):
 			structure = discrete_exact_with_constraints(X_int, weights,
 				key_count, pseudocount, max_parents, constraint_graph, n_jobs)
 		elif algorithm == 'exact':
-			structure = discrete_exact_graph(X_int, weights, key_count,
-				pseudocount, max_parents, n_jobs)
+			structure = discrete_a_star(X_int, weights, key_count,
+				pseudocount, max_parents, False, n_jobs)
+		elif algorithm == 'a* heuristic':
+			structure = discrete_a_star(X_int, weights, key_count,
+				pseudocount, max_parents, True, n_jobs)
 		elif algorithm == 'exact-shortest':
-			structure = discrete_exact_graph_shortest(X_int, weights, key_count,
+			structure = discrete_shortest_path(X_int, weights, key_count,
 				pseudocount, max_parents, n_jobs)
 		else:
 			raise ValueError("Invalid algorithm type passed in. Must be one of 'chow-liu', 'exact', 'exact-shortest'")
 
 		return BayesianNetwork.from_structure(X, structure, weights,state_names=state_names)
+
+
+cdef class ParentGraph(object):
+	"""
+	Generate a parent graph for a single variable over its parents.
+
+	This will generate the parent graph for a single parents given the data.
+	A parent graph is the dynamically generated best parent set and respective
+	score for each combination of parent variables. For example, if we are
+	generating a parent graph for x1 over x2, x3, and x4, we may calculate that
+	having x2 as a parent is better than x2,x3 and so store the value
+	of x2 in the node for x2,x3. 
+
+	Parameters
+	----------
+	X : numpy.ndarray, shape=(n, d)
+		The data to fit the structure too, where each row is a sample and
+		each column corresponds to the associated variable.
+
+	weights : numpy.ndarray, shape=(n,)
+		The weight of each sample as a positive double. Default is None.
+
+	key_count : numpy.ndarray, shape=(d,)
+		The number of unique keys in each column.
+
+	pseudocount : double
+		A pseudocount to add to each possibility.
+
+	max_parents : int
+		The maximum number of parents a node can have. If used, this means
+		using the k-learn procedure. Can drastically speed up algorithms.
+		If -1, no max on parents. Default is -1.
+
+	parent_set : tuple, default ()
+		The variables which are possible parents for this variable. If nothing
+		is passed in then it defaults to all other variables, as one would
+		expect in the naive case. This allows for cases where we want to build
+		a parent graph over only a subset of the variables.
+
+	Returns
+	-------
+	structure : tuple, shape=(d,)
+		The parents for each variable in this SCC
+	"""
+
+	cdef int i, n, d, max_parents
+	cdef tuple parent_set
+	cdef double pseudocount
+	cdef public double all_parents_score
+	cdef dict values
+	cdef numpy.ndarray X
+	cdef numpy.ndarray weights
+	cdef numpy.ndarray key_count
+	cdef int* m
+	cdef int* parents
+
+	def __init__(self, X, weights, key_count, i, pseudocount, max_parents):
+		self.X = X
+		self.weights = weights
+		self.key_count = key_count
+		self.i = i
+		self.pseudocount = pseudocount
+		self.max_parents = max_parents
+		self.values = {}
+		self.n = X.shape[0]
+		self.d = X.shape[1]
+		self.m = <int*> calloc(self.d+2, sizeof(int))
+		self.parents = <int*> calloc(self.d, sizeof(int))
+
+	def __len__(self):
+		return len(self.values)
+
+	def __dealloc__(self):
+		free(self.m)
+		free(self.parents)
+
+	def calculate_value(self, value):
+		cdef int k, parent, l = len(value)
+
+		cdef int* X = <int*> self.X.data
+		cdef int* key_count = <int*> self.key_count.data
+		cdef int* m = self.m
+		cdef int* parents = self.parents
+
+		cdef double* weights = <double*> self.weights.data
+		cdef double score
+
+		m[0] = 1
+		for k, parent in enumerate(value):
+			m[k+1] = m[k] * key_count[parent]
+			parents[k] = parent
+
+		parents[l] = self.i
+		m[l+1] = m[l] * key_count[self.i]
+		m[l+2] = m[l] * (key_count[self.i] - 1)
+
+		with nogil:
+			score = discrete_score_node(X, weights, m, parents, self.n, 
+				l+1, self.d, self.pseudocount)
+
+		return score
+
+	def __getitem__(self, value):
+		if value in self.values:
+			return self.values[value]
+
+		if len(value) > self.max_parents:
+			best_parents, best_score = (), NEGINF
+		else:
+			best_parents, best_score = value, self.calculate_value(value)
+		
+		for variable in value:
+			parent_subset = tuple(parent for parent in value if parent != variable)
+			parents, score = self[parent_subset]
+
+			if score > best_score:
+				best_score = score
+				best_parents = parents
+
+		self.values[value] = (best_parents, best_score)
+		return self.values[value]
 
 
 def discrete_chow_liu_tree(numpy.ndarray X_ndarray, numpy.ndarray weights_ndarray,
@@ -1040,8 +1164,8 @@ def discrete_exact_with_constraints_task(numpy.ndarray X, numpy.ndarray weights,
 	case, parents, children = task
 
 	if case == 0:
-		local_structure = discrete_exact_graph(X[:,parents].copy(), weights,
-			key_count[list(parents)], pseudocount, max_parents, n_jobs)
+		local_structure = discrete_a_star(X[:,parents].copy(), weights,
+			key_count[list(parents)], pseudocount, max_parents, False, n_jobs)
 
 		for i, parent in enumerate(parents):
 			structure[parent] = tuple([parents[k] for k in local_structure[i]])
@@ -1063,7 +1187,7 @@ def discrete_exact_with_constraints_task(numpy.ndarray X, numpy.ndarray weights,
 	return tuple(structure)
 
 
-def discrete_exact_graph_shortest(X, weights, key_count, pseudocount, max_parents, n_jobs):
+def discrete_shortest_path(X, weights, key_count, pseudocount, max_parents, n_jobs):
 	"""
 	Find the optimal graph over a set of variables with no other knowledge.
 
@@ -1139,7 +1263,8 @@ def discrete_exact_graph_shortest(X, weights, key_count, pseudocount, max_parent
 	return tuple(structure)
 
 
-def discrete_exact_graph(X, weights, key_count, pseudocount, max_parents, n_jobs):
+def discrete_a_star(X, weights, key_count, pseudocount, max_parents, heuristic,
+	n_jobs):
 	"""
 	Find the optimal graph over a set of variables with no other knowledge.
 
@@ -1148,7 +1273,9 @@ def discrete_exact_graph(X, weights, key_count, pseudocount, max_parents, n_jobs
 	and parent graphs. This can be used either when no constraint graph is
 	provided or for a SCC which is made up of a node containing a self-loop.
 	It uses DP/A* in order to find the optimal graph without considering all
-	possible topological sorts.
+	possible topological sorts. A heuristic can be used which massively reduces
+	both the computational and memory cost while frequently producing the optimal
+	graph, 
 
 	Parameters
 	----------
@@ -1170,6 +1297,11 @@ def discrete_exact_graph(X, weights, key_count, pseudocount, max_parents, n_jobs
 		using the k-learn procedure. Can drastically speed up algorithms.
 		If -1, no max on parents. Default is -1.
 
+	heuristic : bool, default is True
+		Whether the use a heuristic in order to massive reduce computation
+		and memory time, but without the guarantee of finding the best
+		network.
+
 	n_jobs : int
 		The number of threads to use when learning the structure of the
 		network. This parallelizes the creation of the parent graphs.
@@ -1185,21 +1317,17 @@ def discrete_exact_graph(X, weights, key_count, pseudocount, max_parents, n_jobs
 	cdef int i, n = X.shape[0], d = X.shape[1]
 	cdef list parent_graphs = []
 
-	parent_graphs = Parallel(n_jobs=n_jobs, backend='threading')( 
-		delayed(generate_parent_graph)(X, weights, key_count, i, pseudocount, 
-			max_parents) for i in range(d) )
+	parent_graphs = [ParentGraph(X, weights, key_count, i, pseudocount, max_parents) for i in range(d)]
 
-
-	o = PriorityQueue()
-	c = {}
-
-	all_variables = tuple(range(d))
 	almost_all_variables = {}
 	for i in range(d):
 		almost_all_variables[i] = tuple(j for j in range(d) if j != i)
 
+	o = PriorityQueue()
+	c = {}
+
 	o.push(((), 0, [() for i in range(d)]), 0)
-	while o.n > 0:
+	while not o.empty():
 		weight, (variables, g, structure) = o.pop()
 
 		if variables in c:
@@ -1207,30 +1335,35 @@ def discrete_exact_graph(X, weights, key_count, pseudocount, max_parents, n_jobs
 		else:
 			c[variables] = 1
 
-		if variables == all_variables:
+		if len(variables) == d:
 			return tuple(structure)
 
-		for i in range(d):
-			if i not in variables:
-				parents, g2 = parent_graphs[i][variables]
-				_, h = parent_graphs[i][almost_all_variables[i]]
+		out_set = tuple(i for i in range(d) if i not in variables)
 
-				e = g - g2   # Exact path cost
-				f = g - h    # Heuristic cost 
+		if not heuristic:
+			h = sum(parent_graphs[i][almost_all_variables[i]][1] for i in out_set)
+		else:
+			h = sum(parent_graphs[i][variables][1] for i in out_set)
 
-				local_structure = structure[:]
-				local_structure[i] = parents
-				new_variables = tuple(sorted(variables + (i,)))
-				entry = (new_variables, e, local_structure)
+		for i in out_set:
+			parents, g2 = parent_graphs[i][variables]
 
-				prev_entry = o.get(new_variables)
-				if prev_entry is not None:
-					if prev_entry[0][1] < f:
-						o.push(prev_entry[0], prev_entry[1])
-					else:
-						o.push(entry, f)
-				else:
+			e = g - g2   # Exact path cost
+			f = g - h    # Heuristic cost
+
+			local_structure = structure[:]
+			local_structure[i] = parents
+
+			new_variables = tuple(sorted(variables + (i,)))
+			entry = (new_variables, e, local_structure)
+
+			prev_entry = o.get(new_variables)
+			if prev_entry is not None:
+				if prev_entry[0] > f:
+					o.delete(new_variables)
 					o.push(entry, f)
+			else:
+				o.push(entry, f)
 
 
 def discrete_exact_slap(X, weights, task, key_count, pseudocount, max_parents, 
